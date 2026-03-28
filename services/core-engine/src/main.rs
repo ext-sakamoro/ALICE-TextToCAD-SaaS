@@ -17,7 +17,7 @@ use std::time::Instant;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 
-use alice_lol::print_export::{ExportStats, PrintConfig};
+use alice_lol::print_export::PrintConfig;
 
 // ---------------------------------------------------------------------------
 // State
@@ -38,6 +38,7 @@ struct WorkerState {
 struct GenerateRequest {
     prompt: String,
     #[serde(default = "default_printer")]
+    #[allow(dead_code)]
     printer: String,
     #[serde(default = "default_quality")]
     quality: String,
