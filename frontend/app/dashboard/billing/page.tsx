@@ -11,7 +11,7 @@ export default function BillingPage() {
   const [usage, setUsage] = useState({ today: 0, limit: 5 });
   useEffect(() => { (async () => { try { const supabase = createClient(); const { data: { user } } = await supabase.auth.getUser(); if (!user) return; const { data } = await supabase.from('profiles').select('plan').eq('id', user.id).single(); if (data) { setCurrent(data.plan || 'Free'); setUsage({ today: 0, limit: data.plan === 'Pro' ? 100 : 5 }); } } catch {} })(); }, []);
   const handleUpgrade = async (plan: typeof plans[0]) => {
-    if (plan.name === 'Enterprise') { window.open('mailto:sales@alicelaw.net?subject=Text-to-CAD%20Enterprise', '_blank'); return; }
+    if (plan.name === 'Enterprise') { window.open('mailto:sakamoro@alicelaw.net?subject=Text-to-CAD%20Enterprise', '_blank'); return; }
     if (!plan.priceId) return;
     try { const r = await fetch('/api/stripe/checkout', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ priceId: plan.priceId }) }); const { url } = await r.json(); if (url) window.location.href = url; } catch {}
   };
