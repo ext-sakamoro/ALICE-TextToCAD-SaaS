@@ -1,0 +1,28 @@
+[package]
+name = "text-to-cad-worker"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+description = "Text-to-CAD inference worker: LLM → LOL DSL → SDF → .3mf"
+
+[dependencies]
+axum = { version = "0.7", features = ["macros"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }
+
+# ALICE pipeline
+alice-lol = { path = "../../../ALICE-LOL/alice-lol" }
+alice-sdf = { path = "../../../ALICE-SDF" }
+# alice-print = { path = "../../../ALICE-Print" }  # TODO: 接続時に有効化
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"

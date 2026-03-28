@@ -1,0 +1,6 @@
+apiVersion: v2
+name: ALICE_TEXT_TO_CAD
+description: ALICE TextToCAD
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
