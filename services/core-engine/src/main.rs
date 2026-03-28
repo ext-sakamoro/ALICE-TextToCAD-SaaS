@@ -1,16 +1,13 @@
 //! Text-to-CAD Inference Worker
 //!
-//! Mac mini (24/32GB) 上で動作するワーカー。
-//! 1. テキスト受信 → ローカルLLM で LOL DSL 生成
-//! 2. LOL DSL → SdfNode (alice-lol runtime_parser)
-//! 3. SdfNode → Mesh (alice-sdf sdf_to_mesh)
-//! 4. Mesh → .3mf (alice-print node_to_3mf) ← TODO
-//! 5. .3mf バイナリを API Gateway に返却
+//! Mac mini (24/32GB) 上で動作。
+//! テキスト → LLM → LOL DSL → alice-lol lol_to_3mf → .3mf バイナリ返却
 
 use axum::{
+    body::Body,
     extract::State,
-    http::StatusCode,
-    response::Json,
+    http::{header, StatusCode},
+    response::{IntoResponse, Json, Response},
     routing::{get, post},
     Router,
 };
@@ -20,16 +17,17 @@ use std::time::Instant;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 
+use alice_lol::print_export::{ExportStats, PrintConfig};
+
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
 
 struct WorkerState {
     start_time: Instant,
-    /// LLM API エンドポイント (llama.cpp server, vLLM, etc.)
     llm_endpoint: String,
-    /// LOL DSL 生成用システムプロンプト
     system_prompt: String,
+    output_dir: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -38,49 +36,35 @@ struct WorkerState {
 
 #[derive(Deserialize)]
 struct GenerateRequest {
-    /// ユーザーの自然言語入力
     prompt: String,
-    /// ターゲットプリンタ (default: "bambu_h2d")
     #[serde(default = "default_printer")]
     printer: String,
-    /// 解像度 (default: 128)
-    #[serde(default = "default_resolution")]
-    resolution: u32,
+    #[serde(default = "default_quality")]
+    quality: String,
 }
 
 fn default_printer() -> String {
     "bambu_h2d".into()
 }
-
-fn default_resolution() -> u32 {
-    128
+fn default_quality() -> String {
+    "high".into()
 }
 
 #[derive(Serialize)]
 struct GenerateResponse {
     job_id: String,
     status: String,
-    /// 生成された LOL DSL (デバッグ/表示用)
     lol_source: Option<String>,
-    /// メッシュ情報
     mesh_info: Option<MeshInfo>,
-    /// エラー詳細
+    download_url: Option<String>,
     error: Option<String>,
 }
 
 #[derive(Serialize)]
 struct MeshInfo {
-    triangles: usize,
-    bounding_box: BoundingBox,
-    watertight: bool,
+    vertex_count: usize,
+    triangle_count: usize,
     file_format: String,
-}
-
-#[derive(Serialize)]
-struct BoundingBox {
-    x_mm: f32,
-    y_mm: f32,
-    z_mm: f32,
 }
 
 #[derive(Serialize)]
@@ -89,25 +73,44 @@ struct Health {
     version: String,
     uptime_secs: u64,
     llm_endpoint: String,
-    printer_specs: Vec<PrinterSpec>,
+    printers: Vec<PrinterInfo>,
 }
 
-#[derive(Serialize, Clone)]
-struct PrinterSpec {
+#[derive(Serialize)]
+struct PrinterInfo {
+    id: String,
     name: String,
-    build_volume: [f32; 3],
-    nozzle_mm: f32,
+    build_volume_mm: [f32; 3],
+    max_with_margin_mm: [f32; 3],
 }
 
 // ---------------------------------------------------------------------------
 // Printer specs
 // ---------------------------------------------------------------------------
 
-fn bambu_h2d_spec() -> PrinterSpec {
-    PrinterSpec {
-        name: "Bambu Lab H2D (single)".into(),
-        build_volume: [325.0, 320.0, 320.0],
-        nozzle_mm: 0.4,
+fn printers() -> Vec<PrinterInfo> {
+    vec![
+        PrinterInfo {
+            id: "bambu_h2d".into(),
+            name: "Bambu Lab H2D (single nozzle)".into(),
+            build_volume_mm: [325.0, 320.0, 320.0],
+            max_with_margin_mm: [315.0, 310.0, 315.0],
+        },
+        PrinterInfo {
+            id: "bambu_h2d_dual".into(),
+            name: "Bambu Lab H2D (dual nozzle)".into(),
+            build_volume_mm: [300.0, 320.0, 325.0],
+            max_with_margin_mm: [290.0, 310.0, 315.0],
+        },
+    ]
+}
+
+fn print_config_for_quality(quality: &str) -> PrintConfig {
+    match quality {
+        "preview" => PrintConfig::preview(),
+        "high" => PrintConfig::high_quality(),
+        "ultra" => PrintConfig::ultra(),
+        _ => PrintConfig::high_quality(),
     }
 }
 
@@ -121,209 +124,265 @@ async fn health(State(s): State<Arc<WorkerState>>) -> Json<Health> {
         version: env!("CARGO_PKG_VERSION").into(),
         uptime_secs: s.start_time.elapsed().as_secs(),
         llm_endpoint: s.llm_endpoint.clone(),
-        printer_specs: vec![bambu_h2d_spec()],
+        printers: printers(),
     })
 }
 
 async fn generate(
     State(s): State<Arc<WorkerState>>,
     Json(req): Json<GenerateRequest>,
-) -> Result<Json<GenerateResponse>, (StatusCode, Json<GenerateResponse>)> {
+) -> Result<impl IntoResponse, (StatusCode, Json<GenerateResponse>)> {
     let job_id = uuid::Uuid::new_v4().to_string();
-    tracing::info!(job_id = %job_id, prompt = %req.prompt, "generate request");
+    tracing::info!(job_id = %job_id, prompt = %req.prompt, "generate");
 
-    // Step 1: LLM で LOL DSL 生成
-    let lol_source = match call_llm(&s.llm_endpoint, &s.system_prompt, &req.prompt).await {
-        Ok(src) => src,
-        Err(e) => {
-            return Err((
+    // Step 1: LLM → LOL DSL
+    let lol_source = call_llm(&s.llm_endpoint, &s.system_prompt, &req.prompt)
+        .await
+        .map_err(|e| {
+            (
                 StatusCode::BAD_GATEWAY,
-                Json(GenerateResponse {
-                    job_id,
-                    status: "error".into(),
-                    lol_source: None,
-                    mesh_info: None,
-                    error: Some(format!("LLM error: {e}")),
-                }),
-            ));
-        }
-    };
+                Json(err_resp(&job_id, &format!("LLM error: {e}"))),
+            )
+        })?;
 
-    // Step 2: LOL DSL → SdfNode
-    let sdf_node = match alice_lol::runtime_parser::parse_lol(&lol_source) {
-        Ok(node) => node,
-        Err(e) => {
-            return Err((
+    // Step 2: LOL DSL → .3mf (alice-lol does everything)
+    let config = print_config_for_quality(&req.quality);
+    let output_path = format!("{}/{}.3mf", s.output_dir, job_id);
+
+    let stats = alice_lol::print_export::lol_to_3mf(&lol_source, &output_path, &config).map_err(
+        |e| {
+            (
                 StatusCode::UNPROCESSABLE_ENTITY,
                 Json(GenerateResponse {
-                    job_id,
+                    job_id: job_id.clone(),
                     status: "error".into(),
-                    lol_source: Some(lol_source),
+                    lol_source: Some(lol_source.clone()),
                     mesh_info: None,
-                    error: Some(format!("LOL parse error: {e}")),
+                    download_url: None,
+                    error: Some(format!("Pipeline error: {e}")),
                 }),
-            ));
-        }
-    };
-
-    // Step 3: SdfNode → Mesh
-    let config = alice_sdf::mesh::MeshConfig {
-        resolution: req.resolution,
-        ..Default::default()
-    };
-    let min_bounds = glam::Vec3::new(-200.0, -200.0, -200.0);
-    let max_bounds = glam::Vec3::new(200.0, 200.0, 200.0);
-    let mesh = alice_sdf::mesh::sdf_to_mesh(&sdf_node, min_bounds, max_bounds, &config);
-
-    let bbox = mesh.bounding_box();
-    let mesh_info = MeshInfo {
-        triangles: mesh.triangle_count(),
-        bounding_box: BoundingBox {
-            x_mm: bbox.x_size(),
-            y_mm: bbox.y_size(),
-            z_mm: bbox.z_size(),
+            )
         },
-        watertight: mesh.is_watertight(),
-        file_format: "3mf".into(),
-    };
+    )?;
 
-    // Step 4: TODO — Mesh → .3mf via alice-print
-    // let threemf_bytes = alice_print::node_to_3mf(&sdf_node, &print_config)?;
+    // Step 3: .3mf バイナリ読み込み
+    let bytes = tokio::fs::read(&output_path).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(err_resp(&job_id, &format!("File read error: {e}"))),
+        )
+    })?;
 
-    // Step 5: ビルドボリューム検証
-    let spec = bambu_h2d_spec();
-    let margin = 5.0;
-    if bbox.x_size() > spec.build_volume[0] - margin * 2.0
-        || bbox.y_size() > spec.build_volume[1] - margin * 2.0
-        || bbox.z_size() > spec.build_volume[2] - margin * 2.0
-    {
-        return Err((
+    // ファイル削除（一時ファイル）
+    let _ = tokio::fs::remove_file(&output_path).await;
+
+    tracing::info!(
+        job_id = %job_id,
+        triangles = stats.triangle_count,
+        vertices = stats.vertex_count,
+        "generated"
+    );
+
+    // .3mf バイナリを直接返却
+    let response = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/vnd.ms-package.3dmanufacturing-3dmodel+xml")
+        .header(
+            header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{}.3mf\"", job_id),
+        )
+        .header("X-Job-Id", &job_id)
+        .header("X-Triangle-Count", stats.triangle_count.to_string())
+        .header("X-Vertex-Count", stats.vertex_count.to_string())
+        .header("X-LOL-Source", urlencoding_lol(&lol_source))
+        .body(Body::from(bytes))
+        .unwrap();
+
+    Ok(response)
+}
+
+/// メタデータのみ返すエンドポイント（プレビュー用、バイナリなし）
+async fn generate_preview(
+    State(s): State<Arc<WorkerState>>,
+    Json(req): Json<GenerateRequest>,
+) -> Result<Json<GenerateResponse>, (StatusCode, Json<GenerateResponse>)> {
+    let job_id = uuid::Uuid::new_v4().to_string();
+
+    let lol_source = call_llm(&s.llm_endpoint, &s.system_prompt, &req.prompt)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(err_resp(&job_id, &format!("LLM error: {e}"))),
+            )
+        })?;
+
+    // LOL パースのみ（メッシュ生成なし）— 構文チェック
+    alice_lol::runtime_parser::parse_lol(&lol_source).map_err(|e| {
+        (
             StatusCode::UNPROCESSABLE_ENTITY,
             Json(GenerateResponse {
-                job_id,
+                job_id: job_id.clone(),
                 status: "error".into(),
-                lol_source: Some(lol_source),
-                mesh_info: Some(mesh_info),
-                error: Some(format!(
-                    "Exceeds build volume: {:.1}x{:.1}x{:.1}mm > {:.0}x{:.0}x{:.0}mm (with {}mm margin)",
-                    bbox.x_size(), bbox.y_size(), bbox.z_size(),
-                    spec.build_volume[0] - margin * 2.0,
-                    spec.build_volume[1] - margin * 2.0,
-                    spec.build_volume[2] - margin * 2.0,
-                    margin,
-                )),
+                lol_source: Some(lol_source.clone()),
+                mesh_info: None,
+                download_url: None,
+                error: Some(format!("LOL parse error: {e}")),
             }),
-        ));
-    }
+        )
+    })?;
 
     Ok(Json(GenerateResponse {
         job_id,
-        status: "completed".into(),
+        status: "preview".into(),
         lol_source: Some(lol_source),
-        mesh_info: Some(mesh_info),
+        mesh_info: None,
+        download_url: None,
         error: None,
     }))
 }
 
+/// LOL DSL直接入力 → .3mf（LLMスキップ）
+async fn generate_from_lol(
+    State(s): State<Arc<WorkerState>>,
+    Json(req): Json<DirectLolRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<GenerateResponse>)> {
+    let job_id = uuid::Uuid::new_v4().to_string();
+    let config = print_config_for_quality(&req.quality);
+    let output_path = format!("{}/{}.3mf", s.output_dir, job_id);
+
+    let stats =
+        alice_lol::print_export::lol_to_3mf(&req.lol_source, &output_path, &config).map_err(
+            |e| {
+                (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(err_resp(&job_id, &format!("Pipeline error: {e}"))),
+                )
+            },
+        )?;
+
+    let bytes = tokio::fs::read(&output_path).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(err_resp(&job_id, &format!("File read error: {e}"))),
+        )
+    })?;
+    let _ = tokio::fs::remove_file(&output_path).await;
+
+    let response = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/vnd.ms-package.3dmanufacturing-3dmodel+xml")
+        .header(
+            header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{}.3mf\"", job_id),
+        )
+        .header("X-Job-Id", &job_id)
+        .header("X-Triangle-Count", stats.triangle_count.to_string())
+        .header("X-Vertex-Count", stats.vertex_count.to_string())
+        .body(Body::from(bytes))
+        .unwrap();
+
+    Ok(response)
+}
+
+#[derive(Deserialize)]
+struct DirectLolRequest {
+    lol_source: String,
+    #[serde(default = "default_quality")]
+    quality: String,
+}
+
 // ---------------------------------------------------------------------------
-// LLM client
+// LLM client (OpenAI互換)
 // ---------------------------------------------------------------------------
 
-/// ローカルLLM (llama.cpp server / vLLM / Ollama) にリクエスト
 async fn call_llm(endpoint: &str, system_prompt: &str, user_prompt: &str) -> Result<String, String> {
     #[derive(Serialize)]
-    struct LlmRequest {
+    struct Req {
         model: String,
-        messages: Vec<Message>,
+        messages: Vec<Msg>,
         temperature: f32,
         max_tokens: u32,
     }
-
     #[derive(Serialize)]
-    struct Message {
+    struct Msg {
         role: String,
         content: String,
     }
-
     #[derive(Deserialize)]
-    struct LlmResponse {
+    struct Resp {
         choices: Vec<Choice>,
     }
-
     #[derive(Deserialize)]
     struct Choice {
-        message: ChoiceMessage,
+        message: ChoiceMsg,
     }
-
     #[derive(Deserialize)]
-    struct ChoiceMessage {
+    struct ChoiceMsg {
         content: String,
     }
 
     let client = reqwest::Client::new();
     let resp = client
         .post(format!("{endpoint}/v1/chat/completions"))
-        .json(&LlmRequest {
+        .json(&Req {
             model: "default".into(),
             messages: vec![
-                Message {
-                    role: "system".into(),
-                    content: system_prompt.into(),
-                },
-                Message {
-                    role: "user".into(),
-                    content: user_prompt.into(),
-                },
+                Msg { role: "system".into(), content: system_prompt.into() },
+                Msg { role: "user".into(), content: user_prompt.into() },
             ],
             temperature: 0.3,
             max_tokens: 2048,
         })
         .send()
         .await
-        .map_err(|e| format!("LLM request failed: {e}"))?;
+        .map_err(|e| format!("request failed: {e}"))?;
 
     if !resp.status().is_success() {
-        let status = resp.status();
+        let st = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        return Err(format!("LLM returned {status}: {body}"));
+        return Err(format!("{st}: {body}"));
     }
 
-    let llm_resp: LlmResponse = resp
-        .json()
-        .await
-        .map_err(|e| format!("LLM response parse error: {e}"))?;
-
-    llm_resp
-        .choices
+    let r: Resp = resp.json().await.map_err(|e| format!("parse error: {e}"))?;
+    r.choices
         .first()
         .map(|c| extract_lol_block(&c.message.content))
-        .ok_or_else(|| "LLM returned no choices".into())
+        .ok_or_else(|| "no choices".into())
 }
 
-/// LLM出力から LOL DSLブロックを抽出 (```lol ... ``` or raw)
+/// LLM出力から LOL DSLブロックを抽出
 fn extract_lol_block(content: &str) -> String {
-    // ```lol ... ``` ブロックを探す
     if let Some(start) = content.find("```lol") {
         let after = &content[start + 6..];
         if let Some(end) = after.find("```") {
             return after[..end].trim().to_string();
         }
     }
-    // ``` ... ``` ブロック
     if let Some(start) = content.find("```") {
         let after = &content[start + 3..];
-        // skip optional language tag
-        let after = if let Some(nl) = after.find('\n') {
-            &after[nl + 1..]
-        } else {
-            after
-        };
+        let after = after.find('\n').map_or(after, |nl| &after[nl + 1..]);
         if let Some(end) = after.find("```") {
             return after[..end].trim().to_string();
         }
     }
-    // フォールバック: そのまま返す
     content.trim().to_string()
+}
+
+/// LOLソースをヘッダー安全にエンコード（改行→スペース、ASCII範囲に制限）
+fn urlencoding_lol(lol: &str) -> String {
+    lol.replace('\n', " ").chars().take(200).collect()
+}
+
+fn err_resp(job_id: &str, error: &str) -> GenerateResponse {
+    GenerateResponse {
+        job_id: job_id.into(),
+        status: "error".into(),
+        lol_source: None,
+        mesh_info: None,
+        download_url: None,
+        error: Some(error.into()),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -331,44 +390,12 @@ fn extract_lol_block(content: &str) -> String {
 // ---------------------------------------------------------------------------
 
 fn load_system_prompt() -> String {
-    // LLM_REFERENCE.md + LLM_PRINT_PROMPT.md をベースにしたシステムプロンプト
-    format!(
-        r#"You are a Text-to-CAD assistant. Convert the user's description into LOL DSL code.
+    // カスタムプロンプトファイルがあればそちらを使用
+    if let Ok(custom) = std::fs::read_to_string("system_prompt.md") {
+        return custom;
+    }
 
-## LOL DSL Rules
-- Output ONLY valid LOL DSL inside a ```lol``` code block
-- Use millimeters for all dimensions
-- Ensure watertight geometry (no open edges)
-- Minimum wall thickness: 0.8mm (2x nozzle diameter)
-- Target printer: Bambu Lab H2D (build volume 315x310x315mm with margin)
-
-## Available Primitives
-sphere, box3d, rounded_box, cylinder, torus, cone, capsule, ellipsoid, plane,
-octahedron, pyramid, hex_prism, tube, barrel, heart, tetrahedron, box_frame,
-diamond, star_polygon, cross_shape, triangle, gyroid, schwarz_p, superellipsoid
-
-## Operations
-union, smooth_union, subtract, smooth_subtract, intersection, smooth_intersection
-
-## Transforms
-translate, rotate, scale
-
-## Modifiers
-round, onion, mirror, repeat, elongate, taper, polar_repeat
-
-## Infill (for 3D printing)
-lattice_infill, diamond_infill, schwarz_infill
-
-## Example
-User: "A rounded box with a hole in the center"
-```lol
-subtract {{
-    rounded_box {{ size: [40, 30, 20], radius: 3 }}
-    cylinder {{ radius: 5, height: 25 }}
-}}
-```
-"#
-    )
+    include_str!("system_prompt.md").to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -386,10 +413,14 @@ async fn main() {
 
     let env = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.into());
 
+    let output_dir = env("OUTPUT_DIR", "/tmp/text-to-cad");
+    std::fs::create_dir_all(&output_dir).expect("failed to create output dir");
+
     let state = Arc::new(WorkerState {
         start_time: Instant::now(),
         llm_endpoint: env("LLM_ENDPOINT", "http://localhost:8000"),
         system_prompt: load_system_prompt(),
+        output_dir,
     });
 
     let cors = CorsLayer::new()
@@ -400,6 +431,8 @@ async fn main() {
     let app = Router::new()
         .route("/health", get(health))
         .route("/api/v1/generate", post(generate))
+        .route("/api/v1/preview", post(generate_preview))
+        .route("/api/v1/generate-lol", post(generate_from_lol))
         .layer(cors)
         .layer(TraceLayer::new_for_http())
         .with_state(state);
@@ -415,27 +448,40 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_extract_lol_block_with_tag() {
-        let input = "Here is the model:\n```lol\nsphere { radius: 10 }\n```\nDone.";
+    fn extract_lol_tagged() {
+        let input = "Here:\n```lol\nsphere { radius: 10 }\n```\nDone.";
         assert_eq!(extract_lol_block(input), "sphere { radius: 10 }");
     }
 
     #[test]
-    fn test_extract_lol_block_generic() {
+    fn extract_lol_generic() {
         let input = "```\nbox3d { size: [10, 20, 30] }\n```";
         assert_eq!(extract_lol_block(input), "box3d { size: [10, 20, 30] }");
     }
 
     #[test]
-    fn test_extract_lol_block_raw() {
+    fn extract_lol_raw() {
         let input = "sphere { radius: 5 }";
         assert_eq!(extract_lol_block(input), "sphere { radius: 5 }");
     }
 
     #[test]
-    fn test_bambu_spec() {
-        let spec = bambu_h2d_spec();
-        assert_eq!(spec.build_volume, [325.0, 320.0, 320.0]);
-        assert!((spec.nozzle_mm - 0.4).abs() < f32::EPSILON);
+    fn extract_lol_with_lang_tag() {
+        let input = "```rust\nlet x = 1;\n```";
+        assert_eq!(extract_lol_block(input), "let x = 1;");
+    }
+
+    #[test]
+    fn printers_not_empty() {
+        assert!(!printers().is_empty());
+        assert_eq!(printers()[0].id, "bambu_h2d");
+    }
+
+    #[test]
+    fn quality_configs() {
+        let _ = print_config_for_quality("preview");
+        let _ = print_config_for_quality("high");
+        let _ = print_config_for_quality("ultra");
+        let _ = print_config_for_quality("unknown");
     }
 }

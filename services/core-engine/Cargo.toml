@@ -14,11 +14,11 @@ tower-http = { version = "0.6", features = ["cors", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
+reqwest = { version = "0.12", features = ["json"] }
+tempfile = "3"
 
-# ALICE pipeline
+# ALICE pipeline — alice-lol wraps alice-sdf internally
 alice-lol = { path = "../../../ALICE-LOL/alice-lol" }
-alice-sdf = { path = "../../../ALICE-SDF" }
-# alice-print = { path = "../../../ALICE-Print" }  # TODO: 接続時に有効化
 
 [profile.release]
 opt-level = 3
