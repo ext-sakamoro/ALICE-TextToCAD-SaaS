@@ -144,18 +144,38 @@ Response:
 }
 ```
 
+### POST /api/v1/preview
+
+テキスト → LOL DSL 生成 + 構文チェックのみ（メッシュ生成なし）。
+
+### POST /api/v1/generate-lol
+
+LOL DSL を直接入力 → .3mf 生成（LLMスキップ）。
+
 ### GET /health
 
 Worker状態・対応プリンタ仕様を返す。
+
+## 機能
+
+| 機能 | 状態 |
+|------|------|
+| テキスト → LOL → SDF → .3mf パイプライン | 実装済み |
+| .3mf バイナリレスポンス (Content-Disposition) | 実装済み |
+| 3Dプレビュー (three.js + 3MFLoader) | 実装済み |
+| LOL DSL 直接入力モード | 実装済み |
+| Stripe 課金 (Free/Pro/Enterprise) | 実装済み |
+| 生成履歴 (Supabase RLS) | 実装済み |
+| Cloudflare Tunnel (Mac mini ↔ VPS) | セットアップスクリプト付き |
+| Bambu Lab H2D ビルドボリューム検証 | 実装済み |
 
 ## 技術スタック
 
 | レイヤー | 技術 |
 |---------|------|
 | LLM | Qwen3.5-9B 1.58-bit (.alice) / llama.cpp / Ollama |
-| DSL | alice-lol (LOL DSL → SdfNode) |
-| 3Dエンジン | alice-sdf (SDF → Mesh, SIMD 8-wide) |
-| 3Dプリント | alice-print (Mesh → .3mf, ビルドボリューム検証) |
+| DSL | alice-lol (LOL DSL → SdfNode → .3mf ワンストップ) |
+| 3Dエンジン | alice-sdf (SDF → Mesh, SIMD 8-wide, Marching Cubes) |
 | API | Rust / axum |
 | フロントエンド | Next.js / React / Supabase / Stripe |
 | 課金 | Stripe (月額 or 回数従量) |
