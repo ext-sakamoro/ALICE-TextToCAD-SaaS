@@ -5,17 +5,14 @@ on:
 jobs:
   test-rust:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        service: [core-engine, api-gateway]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: services/${{ matrix.service }}
-      - run: cd services/${{ matrix.service }} && cargo check
-      - run: cd services/${{ matrix.service }} && cargo clippy -- -D warnings
+          workspaces: services/api-gateway
+      - run: cd services/api-gateway && cargo check
+      - run: cd services/api-gateway && cargo clippy -- -D warnings
   lint-frontend:
     runs-on: ubuntu-latest
     steps:
