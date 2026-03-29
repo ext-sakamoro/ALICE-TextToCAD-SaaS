@@ -4,6 +4,7 @@ import { usePathname, useRouter } from 'next/navigation';
 import { createClient } from '@/lib/supabase/client';
 const nav = [
   { href: '/dashboard', label: 'Generate', exact: true },
+  { href: '/dashboard/projects', label: 'Projects' },
   { href: '/dashboard/history', label: 'History' },
   { href: '/dashboard/billing', label: 'Billing' },
   { href: '/dashboard/settings', label: 'Settings' },

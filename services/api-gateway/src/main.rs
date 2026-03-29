@@ -17,6 +17,8 @@ use tower_http::trace::TraceLayer;
 struct AppState {
     core_url: String,
     jwt_secret: String,
+    supabase_url: String,
+    supabase_service_key: String,
     rate_limiters: DashMap<String, TokenBucket>,
     start_time: Instant,
 }
@@ -51,7 +53,14 @@ struct Err { error: String, #[serde(skip_serializing_if = "Option::is_none")] de
 struct LicenseInfo { license: String, source_code: String, notice: String }
 
 #[derive(Deserialize, Serialize, Clone)]
-struct Claims { sub: String, email: Option<String>, role: Option<String>, exp: usize }
+struct Claims {
+    sub: String,
+    email: Option<String>,
+    role: Option<String>,
+    exp: usize,
+    #[serde(default)]
+    plan: Option<String>,
+}
 
 #[tokio::main]
 async fn main() {
@@ -65,6 +74,8 @@ async fn main() {
     let state = Arc::new(AppState {
         core_url: env("CORE_ENGINE_URL", "http://core-engine:8081"),
         jwt_secret: env("JWT_SECRET", "dev-secret-change-me"),
+        supabase_url: env("SUPABASE_URL", ""),
+        supabase_service_key: env("SUPABASE_SERVICE_ROLE_KEY", ""),
         rate_limiters: DashMap::new(),
         start_time: Instant::now(),
     });
@@ -106,11 +117,58 @@ async fn license_handler() -> (HeaderMap, Json<LicenseInfo>) {
     }))
 }
 
+/// Validate API key against Supabase profiles table
+async fn validate_api_key(state: &AppState, key: &str) -> Option<Claims> {
+    if state.supabase_url.is_empty() || state.supabase_service_key.is_empty() {
+        // Supabase not configured — accept key in dev mode
+        return Some(Claims {
+            sub: "api-key-user".into(),
+            email: None,
+            role: Some("api".into()),
+            exp: usize::MAX,
+            plan: Some("Free".into()),
+        });
+    }
+
+    let client = reqwest::Client::new();
+    let url = format!(
+        "{}/rest/v1/profiles?api_key=eq.{}&select=id,plan",
+        state.supabase_url, key
+    );
+
+    #[derive(Deserialize)]
+    struct Profile {
+        id: String,
+        plan: Option<String>,
+    }
+
+    let resp = client
+        .get(&url)
+        .header("apikey", &state.supabase_service_key)
+        .header("Authorization", format!("Bearer {}", state.supabase_service_key))
+        .send()
+        .await
+        .ok()?;
+
+    let profiles: Vec<Profile> = resp.json().await.ok()?;
+    let profile = profiles.first()?;
+
+    Some(Claims {
+        sub: profile.id.clone(),
+        email: None,
+        role: Some("api".into()),
+        exp: usize::MAX,
+        plan: Some(profile.plan.clone().unwrap_or_else(|| "Free".into())),
+    })
+}
+
 async fn auth_mw(
     State(s): State<Arc<AppState>>, mut req: Request, next: Next,
 ) -> Result<Response, (StatusCode, Json<Err>)> {
     let auth = req.headers().get("Authorization").and_then(|h| h.to_str().ok()).map(|s| s.to_string());
     let api_key = req.headers().get("X-API-Key").and_then(|h| h.to_str().ok()).map(|s| s.to_string());
+
+    // JWT Bearer token
     if let Some(a) = &auth {
         if let Some(token) = a.strip_prefix("Bearer ") {
             let mut val = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
@@ -120,28 +178,108 @@ async fn auth_mw(
                 &jsonwebtoken::DecodingKey::from_secret(s.jwt_secret.as_bytes()),
                 &val,
             ) {
-                Ok(data) => { req.extensions_mut().insert(data.claims); return Ok(next.run(req).await); }
+                Ok(data) => {
+                    req.extensions_mut().insert(data.claims);
+                    return Ok(next.run(req).await);
+                }
                 Err(e) => return Err((StatusCode::UNAUTHORIZED, Json(Err { error: "Invalid token".into(), details: Some(e.to_string()) }))),
             }
         }
     }
-    if api_key.is_some() {
-        req.extensions_mut().insert(Claims { sub: "api-key-user".into(), email: None, role: Some("api".into()), exp: usize::MAX });
-        return Ok(next.run(req).await);
+
+    // API Key validation
+    if let Some(key) = api_key {
+        if let Some(claims) = validate_api_key(&s, &key).await {
+            req.extensions_mut().insert(claims);
+            return Ok(next.run(req).await);
+        }
+        return Err((StatusCode::UNAUTHORIZED, Json(Err { error: "Invalid API key".into(), details: None })));
     }
+
     Err((StatusCode::UNAUTHORIZED, Json(Err { error: "Auth required".into(), details: Some("Provide Bearer token or X-API-Key".into()) })))
 }
 
 async fn rate_mw(
     State(s): State<Arc<AppState>>, req: Request, next: Next,
 ) -> Result<Response, (StatusCode, Json<Err>)> {
-    let uid = req.extensions().get::<Claims>().map(|c| c.sub.clone()).unwrap_or_else(|| "anon".into());
+    let claims = req.extensions().get::<Claims>().cloned();
+    let uid = claims.as_ref().map(|c| c.sub.clone()).unwrap_or_else(|| "anon".into());
+    let plan = claims.as_ref().and_then(|c| c.plan.as_deref()).unwrap_or("Free");
+
+    // Plan-based rate limits (tokens per hour)
+    let max_tokens = match plan {
+        "Enterprise" => 100_000.0,
+        "Pro" => 10_000.0,
+        _ => 100.0,
+    };
+
     let ok = {
-        let mut e = s.rate_limiters.entry(uid).or_insert_with(|| TokenBucket::new(10000.0, 10000.0 / 3600.0));
+        let mut e = s.rate_limiters.entry(uid.clone()).or_insert_with(|| TokenBucket::new(max_tokens, max_tokens / 3600.0));
+        // Update bucket limits if plan changed
+        if (e.max_tokens - max_tokens).abs() > 1.0 {
+            *e = TokenBucket::new(max_tokens, max_tokens / 3600.0);
+        }
         e.try_consume()
     };
-    if !ok { return Err((StatusCode::TOO_MANY_REQUESTS, Json(Err { error: "Rate limit exceeded".into(), details: None }))); }
-    Ok(next.run(req).await)
+    if !ok {
+        return Err((StatusCode::TOO_MANY_REQUESTS, Json(Err { error: "Rate limit exceeded".into(), details: None })));
+    }
+
+    // Record usage asynchronously
+    let state = s.clone();
+    let method = req.method().to_string();
+    let endpoint = req.uri().path().to_string();
+    let uid_clone = uid.clone();
+    let start = Instant::now();
+
+    let resp = next.run(req).await;
+
+    let status_code = resp.status().as_u16() as i32;
+    let response_time_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+    // Fire-and-forget usage recording
+    tokio::spawn(async move {
+        record_usage(&state, &uid_clone, &endpoint, &method, status_code, response_time_ms).await;
+    });
+
+    Ok(resp)
+}
+
+async fn record_usage(
+    state: &AppState,
+    user_id: &str,
+    endpoint: &str,
+    method: &str,
+    status_code: i32,
+    response_time_ms: f64,
+) {
+    if state.supabase_url.is_empty() || state.supabase_service_key.is_empty() {
+        return;
+    }
+    // Skip non-UUID user IDs (dev mode)
+    if user_id.len() != 36 {
+        return;
+    }
+
+    let client = reqwest::Client::new();
+    let url = format!("{}/rest/v1/api_usage", state.supabase_url);
+
+    let body = serde_json::json!({
+        "user_id": user_id,
+        "endpoint": endpoint,
+        "method": method,
+        "status_code": status_code,
+        "response_time_ms": response_time_ms,
+    });
+
+    let _ = client
+        .post(&url)
+        .header("apikey", &state.supabase_service_key)
+        .header("Authorization", format!("Bearer {}", state.supabase_service_key))
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await;
 }
 
 async fn forward(url: &str, req: Request) -> Result<Response, (StatusCode, Json<Err>)> {

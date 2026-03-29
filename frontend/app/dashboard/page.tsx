@@ -1,113 +1,28 @@
 'use client';
 import { useState, lazy, Suspense } from 'react';
-import { createClient } from '@/lib/supabase/client';
+import { useGeneration } from '@/lib/hooks/use-generation';
 
 const ModelPreview = lazy(() => import('./components/ModelPreview'));
-
-interface GenerateResult {
-  jobId: string;
-  lolSource: string;
-  triangles: number;
-  vertices: number;
-  error?: string;
-}
 
 export default function DashboardPage() {
   const [prompt, setPrompt] = useState('');
   const [quality, setQuality] = useState('high');
-  const [loading, setLoading] = useState(false);
-  const [result, setResult] = useState<GenerateResult | null>(null);
   const [lolMode, setLolMode] = useState(false);
   const [lolSource, setLolSource] = useState('');
   const [previewBlob, setPreviewBlob] = useState<Blob | null>(null);
 
-  const workerUrl = process.env.NEXT_PUBLIC_WORKER_URL || 'http://localhost:8081';
-
-  const saveGeneration = async (gen: {
-    prompt: string;
-    lol_source: string;
-    triangle_count: number;
-    vertex_count: number;
-    quality: string;
-    status: string;
-    error: string | null;
-  }) => {
-    try {
-      const supabase = createClient();
-      const { data: { user } } = await supabase.auth.getUser();
-      if (!user) return;
-      await supabase.from('generations').insert({ ...gen, user_id: user.id });
-    } catch {
-      // Supabase not configured — skip silently
-    }
-  };
+  const { loading, result, error, run } = useGeneration();
 
   const handleGenerate = async () => {
-    setLoading(true);
-    setResult(null);
     setPreviewBlob(null);
-    try {
-      const endpoint = lolMode ? '/api/v1/generate-lol' : '/api/v1/generate';
-      const body = lolMode
-        ? { lol_source: lolSource, quality }
-        : { prompt, quality };
-
-      const resp = await fetch(`${workerUrl}${endpoint}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-      });
-
-      if (!resp.ok) {
-        const err = await resp.json();
-        const errResult = {
-          jobId: err.job_id || '',
-          lolSource: err.lol_source || '',
-          triangles: 0,
-          vertices: 0,
-          error: err.error || `HTTP ${resp.status}`,
-        };
-        setResult(errResult);
-        await saveGeneration({
-          prompt: lolMode ? `[LOL] ${lolSource.slice(0, 200)}` : prompt,
-          lol_source: err.lol_source || '',
-          triangle_count: 0,
-          vertex_count: 0,
-          quality,
-          status: 'error',
-          error: errResult.error || null,
-        });
-        return;
-      }
-
-      const jobId = resp.headers.get('X-Job-Id') || '';
-      const triangles = parseInt(resp.headers.get('X-Triangle-Count') || '0', 10);
-      const vertices = parseInt(resp.headers.get('X-Vertex-Count') || '0', 10);
-      const lol = resp.headers.get('X-LOL-Source') || '';
-
-      const blob = await resp.blob();
-      setPreviewBlob(blob);
-      setResult({ jobId, lolSource: lol, triangles, vertices });
-
-      await saveGeneration({
-        prompt: lolMode ? `[LOL] ${lolSource.slice(0, 200)}` : prompt,
-        lol_source: lol,
-        triangle_count: triangles,
-        vertex_count: vertices,
-        quality,
-        status: 'completed',
-        error: null,
-      });
-    } catch (e) {
-      setResult({
-        jobId: '',
-        lolSource: '',
-        triangles: 0,
-        vertices: 0,
-        error: e instanceof Error ? e.message : 'Unknown error',
-      });
-    } finally {
-      setLoading(false);
+    const res = await run({
+      mode: lolMode ? 'lol' : 'natural',
+      prompt,
+      lolSource,
+      quality,
+    });
+    if (res) {
+      setPreviewBlob(res.blob);
     }
   };
 
@@ -194,7 +109,7 @@ export default function DashboardPage() {
             <ModelPreview blob={previewBlob} />
           </Suspense>
 
-          {result && !result.error && (
+          {result && (
             <div className="flex items-center justify-between">
               <div className="text-xs text-muted-foreground space-x-4">
                 <span>{result.triangles.toLocaleString()} triangles</span>
@@ -212,14 +127,14 @@ export default function DashboardPage() {
       </div>
 
       {/* Result / Error */}
-      {result && (
-        <div className={`border rounded-lg p-4 ${result.error ? 'border-red-500 bg-red-50 dark:bg-red-950' : 'border-green-500 bg-green-50 dark:bg-green-950'}`}>
-          {result.error ? (
+      {(result || error) && (
+        <div className={`border rounded-lg p-4 ${error ? 'border-red-500 bg-red-50 dark:bg-red-950' : 'border-green-500 bg-green-50 dark:bg-green-950'}`}>
+          {error ? (
             <div>
               <p className="font-medium text-red-700 dark:text-red-300">Error</p>
-              <p className="text-sm mt-1">{result.error}</p>
+              <p className="text-sm mt-1">{error.error}</p>
             </div>
-          ) : (
+          ) : result ? (
             <div>
               <p className="font-medium text-green-700 dark:text-green-300">Generated successfully</p>
               {result.lolSource && (
@@ -229,7 +144,7 @@ export default function DashboardPage() {
                 </details>
               )}
             </div>
-          )}
+          ) : null}
         </div>
       )}
 

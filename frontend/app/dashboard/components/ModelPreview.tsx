@@ -17,13 +17,14 @@ function MeshViewer({ blob }: { blob: Blob }) {
       try {
         // .3mf is a ZIP file containing XML with mesh data
         // For preview, we parse the binary STL-like data from the 3MF
+        // @ts-expect-error three/addons requires bundler moduleResolution
         const { ThreeMFLoader } = await import('three/addons/loaders/3MFLoader.js');
         const loader = new ThreeMFLoader();
         const arrayBuffer = await blob.arrayBuffer();
         const object = loader.parse(arrayBuffer);
 
         // Extract first mesh geometry from the loaded group
-        let geo: THREE.BufferGeometry | null = null;
+        let geo: THREE.BufferGeometry | undefined;
         object.traverse((child: THREE.Object3D) => {
           if (!geo && child instanceof THREE.Mesh) {
             geo = child.geometry as THREE.BufferGeometry;
@@ -31,10 +32,11 @@ function MeshViewer({ blob }: { blob: Blob }) {
         });
 
         if (geo) {
-          geo.computeBoundingSphere();
-          if (geo.boundingSphere) {
-            const radius = geo.boundingSphere.radius;
-            const center = geo.boundingSphere.center;
+          const g = geo as THREE.BufferGeometry;
+          g.computeBoundingSphere();
+          if (g.boundingSphere) {
+            const radius = g.boundingSphere.radius;
+            const center = g.boundingSphere.center;
             (camera as THREE.PerspectiveCamera).position.set(
               center.x + radius * 2,
               center.y + radius * 1.5,
@@ -42,7 +44,7 @@ function MeshViewer({ blob }: { blob: Blob }) {
             );
             (camera as THREE.PerspectiveCamera).lookAt(center);
           }
-          setGeometry(geo);
+          setGeometry(g);
         }
       } catch (e) {
         console.error('Failed to load 3MF:', e);
