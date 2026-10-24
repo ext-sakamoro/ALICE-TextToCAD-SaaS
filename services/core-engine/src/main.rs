@@ -1,6 +1,6 @@
 //! Text-to-CAD Inference Worker
 //!
-//! Mac mini (24/32GB) 上で動作。
+//! 推論機 (arm64、24-32 GB) 上で動作。
 //! テキスト → LLM → LOL DSL → alice-lol lol_to_3mf → .3mf バイナリ返却
 
 use axum::{

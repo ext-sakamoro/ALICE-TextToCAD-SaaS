@@ -24,7 +24,7 @@
                │ REST (Cloudflare Tunnel)
                ▼
 ┌─────────────────────────────────────────┐
-│  Mac mini 24/32GB (自宅 or colo)        │
+│  推論機 (arm64、24-32 GB)               │
 │  ┌─────────────────────────────────┐    │
 │  │  Inference Worker (Rust)        │    │
 │  │  1. Qwen3.5-9B 1.58-bit LLM    │    │
@@ -70,17 +70,6 @@ subtract {
   ▼ phone_stand.3mf (Bambu Studio で即印刷)
 ```
 
-## 差別化
-
-| 項目 | 既存 Text-to-CAD (Zoo.dev等) | ALICE Text-to-CAD |
-|------|----------------------------|-------------------|
-| 表現方式 | メッシュ (三角形の集合) | **SDF数式** (距離関数) |
-| 水密保証 | 後処理で修復 | **構造的に保証** |
-| Boolean演算 | メッシュCSGで破綻しやすい | **SDF演算で完全** |
-| パラメトリック | 不可 | **LOL DSLで変更可能** |
-| ローカル推論 | クラウドAPI依存 | **Mac mini で完結** |
-| コスト | API従量課金 | **初期投資のみ** |
-
 ## ターゲットプリンタ
 
 | プリンタ | ビルドボリューム (mm) | 推奨最大 (5mmマージン) |
@@ -100,7 +89,7 @@ cd ../../frontend
 npm install && npm run build
 ```
 
-### Mac mini側 (Inference Worker)
+### 推論機側 (Inference Worker)
 
 ```bash
 # LLMサーバー起動 (llama.cpp server)
@@ -166,7 +155,7 @@ Worker状態・対応プリンタ仕様を返す。
 | LOL DSL 直接入力モード | 実装済み |
 | Stripe 課金 (Free/Pro/Enterprise) | 実装済み |
 | 生成履歴 (Supabase RLS) | 実装済み |
-| Cloudflare Tunnel (Mac mini ↔ VPS) | セットアップスクリプト付き |
+| Cloudflare Tunnel (推論機 ↔ VPS) | セットアップスクリプト付き |
 | Bambu Lab H2D ビルドボリューム検証 | 実装済み |
 
 ## 技術スタック
@@ -179,7 +168,7 @@ Worker状態・対応プリンタ仕様を返す。
 | API | Rust / axum |
 | フロントエンド | Next.js / React / Supabase / Stripe |
 | 課金 | Stripe (月額 or 回数従量) |
-| 接続 | Cloudflare Tunnel (Mac mini ↔ VPS) |
+| 接続 | Cloudflare Tunnel (推論機 ↔ VPS) |
 
 ## ライセンス
 

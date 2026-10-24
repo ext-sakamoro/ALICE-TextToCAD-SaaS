@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Cloudflare Tunnel: Mac mini (Worker) → VPS (API Gateway)
+# Cloudflare Tunnel: 推論機 (Worker) → VPS (API Gateway)
 #
 # Prerequisites:
 #   brew install cloudflared

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Mac mini Text-to-CAD Worker 起動スクリプト
+# 推論機 Text-to-CAD Worker 起動スクリプト
 #
 # Usage:
 #   ./scripts/start-worker.sh                    # デフォルト (localhost:8000 LLM)
