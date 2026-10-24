@@ -1,0 +1,30 @@
+[[public-text.allow]]
+path = ".public-text.toml"
+class = "agent process"
+count = 1
+why = "the path of the start script of the inference process, named in the entry below"
+
+[[public-text.allow]]
+path = "README.md"
+class = "agent process"
+count = 4
+why = "the inference process of the product (a component of the service)"
+
+[[public-text.allow]]
+path = ".env.example"
+class = "agent process"
+count = 4
+why = "the inference process of the product (a component of the service)"
+
+[[public-text.allow]]
+path = "scripts/setup-tunnel.sh"
+class = "agent process"
+count = 8
+why = "the inference process of the product (a component of the service)"
+
+[[public-text.allow]]
+path = "scripts/start-worker.sh"
+class = "agent process"
+count = 8
+why = "the inference process of the product (a component of the service)"
+
