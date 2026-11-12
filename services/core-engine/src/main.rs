@@ -294,7 +294,7 @@ struct DirectLolRequest {
 }
 
 // ---------------------------------------------------------------------------
-// LLM client (OpenAI互換)
+// LLM client (chat completions 互換)
 // ---------------------------------------------------------------------------
 
 async fn call_llm(endpoint: &str, system_prompt: &str, user_prompt: &str) -> Result<String, String> {

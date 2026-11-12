@@ -22,8 +22,6 @@ Thumbs.db
 coverage/
 export-data/
 redis-data/
-CLAUDE.md
-.claude/
 *.3mf
 *.stl
 *.obj

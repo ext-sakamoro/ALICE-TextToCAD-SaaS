@@ -45,7 +45,7 @@
 ```
 "Make a phone stand with cable hole"
   │
-  ▼ LLM (OpenAI互換API: llama.cpp / vLLM / Ollama)
+  ▼ LLM (chat completions 互換 API: llama.cpp / vLLM / Ollama)
   │
   ▼ LOL DSL
 subtract {
